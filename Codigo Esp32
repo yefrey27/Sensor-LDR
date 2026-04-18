@@ -1,0 +1,323 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+
+// ─── PINES ───────────────────────────────────────────
+#define PIN_LDR       34
+#define LED_ROJO      13
+#define LED_AMARILLO  12
+#define LED_VERDE     14
+#define LED_BUILTIN   2    // LED integrado del ESP32
+#define BTN_CONFIG    0    // Botón BOOT del ESP32
+
+// ─── SUPABASE ─────────────────────────────────────────
+const char* SUPABASE_URL = "https://dvjogiuycggkowmsnfmz.supabase.co";
+const char* SUPABASE_KEY = "sb_publishable_xU1lmBoXs91ptXFB48U74Q_KnOSlgft";
+
+// ─── AP CONFIG ────────────────────────────────────────
+const char* AP_SSID = "ESP32-LDR-SETUP";
+const char* AP_PASS = "";   // Red abierta
+
+// ─── OBJETOS ──────────────────────────────────────────
+Preferences prefs;
+WebServer   server(80);
+
+String savedSSID = "";
+String savedPASS = "";
+bool   modoAP    = false;
+
+// ─── TEMPORIZACIÓN ────────────────────────────────────
+unsigned long ultimoEnvio        = 0;
+unsigned long ultimaConsultaLed  = 0;
+const unsigned long INTERVALO_SENSOR = 200;   // ms entre lecturas LDR
+const unsigned long INTERVALO_LED    = 1000;   // ms entre consultas al LED
+
+int  ultimoValorEnviado = -1;
+bool estadoLedBuiltin   = false;   // estado local del LED integrado
+
+// ─── HTML PÁGINA CONFIGURACIÓN ────────────────────────
+const char* HTML_CONFIG = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Config</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;
+       display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+  .card{background:#1e293b;border-radius:16px;padding:28px;width:100%;max-width:400px;
+        box-shadow:0 4px 32px rgba(0,0,0,.5)}
+  h1{font-size:20px;margin-bottom:4px;color:#38bdf8}
+  p{font-size:13px;color:#94a3b8;margin-bottom:20px}
+  label{font-size:13px;color:#94a3b8;display:block;margin-bottom:6px}
+  select,input{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;
+               border-radius:8px;color:#e2e8f0;font-size:14px;margin-bottom:14px;outline:none}
+  select:focus,input:focus{border-color:#38bdf8}
+  button{width:100%;padding:12px;background:#0ea5e9;border:none;border-radius:8px;
+         color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:4px}
+  button:active{background:#0284c7}
+  #status{margin-top:14px;text-align:center;font-size:13px;color:#34d399;min-height:20px}
+  .loader{display:none;text-align:center;margin-top:10px;color:#94a3b8;font-size:13px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⚙️ Configurar ESP32</h1>
+  <p>Selecciona tu red WiFi e ingresa la contraseña</p>
+
+  <label>Red WiFi disponible</label>
+  <select id="ssid">
+    <option value="">Buscando redes...</option>
+  </select>
+
+  <label>Contraseña</label>
+  <input type="password" id="pass" placeholder="Ingresa la contraseña">
+
+  <button onclick="guardar()">💾 Guardar y Conectar</button>
+  <div id="status"></div>
+  <div class="loader" id="loader">Conectando, espera...</div>
+</div>
+<script>
+  async function cargarRedes(){
+    try{
+      const r = await fetch('/scan');
+      const d = await r.json();
+      const sel = document.getElementById('ssid');
+      sel.innerHTML = d.networks.map(n=>
+        `<option value="${n.ssid}">${n.ssid} (${n.rssi} dBm)</option>`
+      ).join('');
+    }catch(e){
+      document.getElementById('ssid').innerHTML='<option>Error al escanear</option>';
+    }
+  }
+  async function guardar(){
+    const ssid = document.getElementById('ssid').value;
+    const pass = document.getElementById('pass').value;
+    if(!ssid){alert('Selecciona una red');return;}
+    document.getElementById('loader').style.display='block';
+    document.getElementById('status').textContent='';
+    try{
+      const r = await fetch('/save',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ssid,pass})
+      });
+      const d = await r.json();
+      document.getElementById('status').textContent = d.msg;
+    }catch(e){
+      document.getElementById('status').textContent='Error al guardar';
+    }
+    document.getElementById('loader').style.display='none';
+  }
+  cargarRedes();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─── FUNCIONES LEDS SENSOR ────────────────────────────
+void apagarLEDs(){
+  digitalWrite(LED_ROJO,    LOW);
+  digitalWrite(LED_AMARILLO,LOW);
+  digitalWrite(LED_VERDE,   LOW);
+}
+
+void controlarLEDs(int valor){
+  apagarLEDs();
+  if     (valor < 1000)                      digitalWrite(LED_ROJO,    HIGH);
+  else if(valor >= 1000 && valor < 2500)     digitalWrite(LED_AMARILLO,HIGH);
+  else                                       digitalWrite(LED_VERDE,   HIGH);
+}
+
+// ─── ENVÍO SENSOR A SUPABASE ──────────────────────────
+void enviarSupabase(int valor){
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/sensores";
+  http.begin(url);
+  http.addHeader("Content-Type",  "application/json");
+  http.addHeader("apikey",        SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Prefer",        "return=minimal");
+
+  String body = "{\"valor_ldr\":" + String(valor) + "}";
+  int code = http.POST(body);
+  Serial.printf("Supabase sensor → %d | LDR: %d\n", code, valor);
+  http.end();
+}
+
+// ─── CONSULTAR ESTADO LED INTEGRADO ───────────────────
+// Lee la tabla led_control (id=1) y aplica el estado al pin GPIO 2
+void consultarLedControl(){
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/led_control?id=eq.1&select=estado";
+  http.begin(url);
+  http.addHeader("apikey",        SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+
+  int code = http.GET();
+  if(code == 200){
+    String payload = http.getString();
+    // Respuesta esperada: [{"estado":true}] o [{"estado":false}]
+    StaticJsonDocument<128> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if(!err && doc.is<JsonArray>() && doc.as<JsonArray>().size() > 0){
+      bool nuevo = doc[0]["estado"].as<bool>();
+      if(nuevo != estadoLedBuiltin){
+        estadoLedBuiltin = nuevo;
+        digitalWrite(LED_BUILTIN, estadoLedBuiltin ? HIGH : LOW);
+        Serial.printf("LED integrado (GPIO2): %s\n", estadoLedBuiltin ? "ENCENDIDO" : "APAGADO");
+      }
+    }
+  } else {
+    Serial.printf("Error consultando led_control: HTTP %d\n", code);
+  }
+  http.end();
+}
+
+// ─── SERVIDOR WEB (MODO AP) ────────────────────────────
+void iniciarServidorAP(){
+  server.on("/", HTTP_GET, [](){
+    server.send(200, "text/html", HTML_CONFIG);
+  });
+
+  server.on("/scan", HTTP_GET, [](){
+    int n = WiFi.scanNetworks();
+    String json = "{\"networks\":[";
+    for(int i = 0; i < n; i++){
+      if(i > 0) json += ",";
+      json += "{\"ssid\":\"" + WiFi.SSID(i) + "\","
+              "\"rssi\":"    + WiFi.RSSI(i) + "}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/save", HTTP_POST, [](){
+    String body = server.arg("plain");
+    StaticJsonDocument<256> doc;
+    deserializeJson(doc, body);
+    String ssid = doc["ssid"].as<String>();
+    String pass = doc["pass"].as<String>();
+
+    prefs.begin("wifi-cfg", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+
+    server.send(200,"application/json",
+      "{\"msg\":\"Guardado. Reiniciando en 3s...\"}");
+    delay(3000);
+    ESP.restart();
+  });
+
+  server.begin();
+  Serial.println("Servidor AP iniciado en http://192.168.4.1");
+}
+
+// ─── MODO AP ──────────────────────────────────────────
+void iniciarModoAP(){
+  modoAP = true;
+  apagarLEDs();
+  digitalWrite(LED_AMARILLO, HIGH);  // Indica modo config
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("AP: %s → 192.168.4.1\n", AP_SSID);
+  iniciarServidorAP();
+}
+
+// ─── CONECTAR WIFI ────────────────────────────────────
+bool conectarWiFi(const String& ssid, const String& pass){
+  Serial.printf("Conectando a %s...\n", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  int intentos = 0;
+  while(WiFi.status() != WL_CONNECTED && intentos < 30){
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+  if(WiFi.status() == WL_CONNECTED){
+    Serial.printf("\nConectado. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+  return false;
+}
+
+// ─── SETUP ────────────────────────────────────────────
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(LED_ROJO,    OUTPUT);
+  pinMode(LED_AMARILLO,OUTPUT);
+  pinMode(LED_VERDE,   OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);   // LED integrado GPIO 2
+  pinMode(BTN_CONFIG,  INPUT_PULLUP);
+
+  apagarLEDs();
+  digitalWrite(LED_BUILTIN, LOW);  // LED integrado apagado al inicio
+
+  // Leer credenciales guardadas
+  prefs.begin("wifi-cfg", true);
+  savedSSID = prefs.getString("ssid", "");
+  savedPASS = prefs.getString("pass", "");
+  prefs.end();
+
+  // Forzar modo AP si botón presionado o no hay credenciales
+  bool botonPresionado = (digitalRead(BTN_CONFIG) == LOW);
+
+  if(savedSSID.isEmpty() || botonPresionado){
+    Serial.println("→ Modo configuración AP");
+    iniciarModoAP();
+  } else {
+    bool ok = conectarWiFi(savedSSID, savedPASS);
+    if(!ok){
+      Serial.println("WiFi falló → Modo AP");
+      iniciarModoAP();
+    }
+  }
+}
+
+// ─── LOOP ─────────────────────────────────────────────
+void loop(){
+  if(modoAP){
+    server.handleClient();
+    return;
+  }
+
+  // Reconexión automática
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.println("WiFi perdido, reconectando...");
+    conectarWiFi(savedSSID, savedPASS);
+    delay(1000);
+    return;
+  }
+
+  unsigned long ahora = millis();
+
+  // ── Leer LDR y enviar a Supabase ──
+  int ldr = analogRead(PIN_LDR);
+  controlarLEDs(ldr);
+  Serial.printf("LDR: %d\n", ldr);
+
+  if(ahora - ultimoEnvio >= INTERVALO_SENSOR){
+    if(abs(ldr - ultimoValorEnviado) > 5){   // solo si cambia suficiente
+      enviarSupabase(ldr);
+      ultimoValorEnviado = ldr;
+    }
+    ultimoEnvio = ahora;
+  }
+
+  // ── Consultar estado LED integrado cada 3s ──
+  if(ahora - ultimaConsultaLed >= INTERVALO_LED){
+    consultarLedControl();
+    ultimaConsultaLed = ahora;
+  }
+
+  delay(10);
+}
