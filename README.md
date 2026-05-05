@@ -23,6 +23,7 @@ Tabla de Contenidos
 16. Dependencias (package.json)
 
 
+
 1. Descripción General
 Sistema IoT que permite monitorear en tiempo real la intensidad lumínica medida por un sensor LDR conectado a un microcontrolador ESP32. Los datos se almacenan en una base de datos en la nube (Supabase / PostgreSQL) y se visualizan a través de un dashboard web con gráficas interactivas Plotly.js. El sistema también permite controlar un LED integrado del ESP32 de forma remota desde el navegador.
 
