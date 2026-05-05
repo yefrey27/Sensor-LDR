@@ -7,7 +7,7 @@ const EMAILJS_SERVICE  = 'service_2e9dusl';
 const EMAILJS_TEMPLATE = 'template_saqa72y';
 const EMAILJS_PUBLIC   = 'CYdJxx9cWYeHLTDEC';
 
-// Base URL de la API Express (mismo servidor si se sirve con Express)
+// Base URL de la API Express
 const API_BASE = window.location.origin;
 
 // ══════════════════════════════════════════
